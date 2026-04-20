@@ -61,7 +61,23 @@ _NEWS_TERMS = ("news", "headline", "breaking", "today", "新闻", "头条", "快
 
 
 def _has_any_term(text: str, terms: tuple[str, ...]) -> bool:
-    return any(term in text for term in terms)
+    """Check whether *text* contains any of the given *terms*.
+
+    English terms are matched with word boundaries (``\\b``) so that
+    short words like "did" don't false-positive on "didn't" or "candidate".
+    CJK terms use plain substring matching since Chinese/Japanese/Korean
+    don't have whitespace-delimited word boundaries.
+    """
+    for term in terms:
+        if any("\u4e00" <= ch <= "\u9fff" for ch in term):
+            # CJK term — substring match
+            if term in text:
+                return True
+        else:
+            # English / Latin term — word-boundary match
+            if re.search(rf"\b{re.escape(term)}\b", text):
+                return True
+    return False
 
 
 def infer_scope(

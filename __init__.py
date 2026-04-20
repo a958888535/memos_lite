@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import queue
-import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -36,25 +35,12 @@ _COMPANION_SKILL_DESCRIPTION = (
     "Interpret memos_lite skill-update hint metadata and decide whether native Hermes "
     "skill_manage should be used."
 )
-_PREFETCH_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]+")
+from .tokenize import cjk_aware_tokens
+
+
 _PREFETCH_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "as",
-    "continue",
-    "for",
-    "help",
-    "i",
-    "last",
-    "me",
-    "my",
-    "of",
-    "on",
-    "please",
-    "the",
-    "to",
-    "write",
+    "a", "an", "and", "as", "continue", "for", "help", "i",
+    "last", "me", "my", "of", "on", "please", "the", "to", "write",
 }
 
 
@@ -63,20 +49,7 @@ def _normalize_query(text: str) -> str:
 
 
 def _query_tokens(text: str) -> set[str]:
-    tokens: set[str] = set()
-    for token in _PREFETCH_TOKEN_RE.findall(_normalize_query(text)):
-        if not token or token in _PREFETCH_STOPWORDS:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
-            tokens.add(token)
-            for size in (2, 3):
-                if len(token) < size:
-                    continue
-                for index in range(len(token) - size + 1):
-                    tokens.add(token[index : index + size])
-            continue
-        tokens.add(token)
-    return tokens
+    return cjk_aware_tokens(text) - _PREFETCH_STOPWORDS
 
 
 def _cache_matches_query(cached_query: str, current_query: str) -> bool:

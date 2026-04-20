@@ -5,6 +5,11 @@ import re
 from .redaction import contains_secret
 
 
+# ---- Tunable thresholds (magic numbers centralised here) ----
+_DEFAULT_MIN_STORE_CHARS = 40   # minimum text length for storage
+_MAX_NEWLINES_TOOL_OUTPUT = 60  # reject tool output with more line breaks
+_MIN_RETRIEVE_CHARS = 12        # minimum query length for auto-retrieval
+
 _ACKS = {
     "ok",
     "okay",
@@ -45,7 +50,7 @@ def has_memory_cue(text: str) -> bool:
     return any(cue in lowered for cue in _MEMORY_CUES)
 
 
-def should_store_text(text: str, *, source: str = "conversation", min_chars: int = 40) -> bool:
+def should_store_text(text: str, *, source: str = "conversation", min_chars: int = _DEFAULT_MIN_STORE_CHARS) -> bool:
     stripped = str(text or "").strip()
     normalized = _normalize(stripped)
     if not stripped:
@@ -62,7 +67,7 @@ def should_store_text(text: str, *, source: str = "conversation", min_chars: int
         return False
     if "i can't help with that" in normalized or "cannot assist" in normalized:
         return False
-    if "exit code:" in normalized or stripped.count("\n") > 60:
+    if "exit code:" in normalized or stripped.count("\n") > _MAX_NEWLINES_TOOL_OUTPUT:
         return False
     if len(stripped) < min_chars and not has_memory_cue(stripped):
         return False
@@ -84,6 +89,6 @@ def should_auto_retrieve(query: str, *, manual: bool = False) -> bool:
         return False
     if _SLASH_COMMAND_RE.match(stripped):
         return False
-    if len(stripped) < 12:
+    if len(stripped) < _MIN_RETRIEVE_CHARS:
         return False
     return True

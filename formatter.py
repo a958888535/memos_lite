@@ -11,8 +11,22 @@ _SYSTEM_NOTE_RE = re.compile(
     r"\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as informational background data\.\]",
     re.IGNORECASE,
 )
-_INSTRUCTIONAL_TEXT_RE = re.compile(
-    r"(?i)\b(system prompt|assistant should|hermes should|recommended action|use skill_manage|learning feedback)\b"
+_INSTRUCTIONAL_PATTERNS = (
+    # Only match when these phrases appear in an *imperative / directive* context:
+    # must be followed by a verb-like word or at sentence start after ^/[,.
+    re.compile(
+        r"(?:^|[\[(,.\s])"
+        r"\s*"
+        r"(?:"
+        r"system prompt\s*(?:says|instructs?|requires|must)\b"
+        r"|assistant should\s+\w+"
+        r"|hermes should\s+\w+"
+        r"|recommended action\s*[:：]\s*\w+"
+        r"|use skill_manage\s+to\s+\w+"
+        r"|learning feedback\s*[:：]\s*\w+"
+        r")",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -21,9 +35,10 @@ def _clean_text(value: str) -> str:
     text = _MEMORY_CONTEXT_RE.sub("", text)
     text = _SYSTEM_NOTE_RE.sub("", text)
     text = text.replace("Learning feedback", "")
+    # Remove instructional fragments but keep surrounding text.
+    for pat in _INSTRUCTIONAL_PATTERNS:
+        text = pat.sub("", text)
     text = " ".join(text.split())
-    if _INSTRUCTIONAL_TEXT_RE.search(text):
-        return ""
     return text.strip()
 
 

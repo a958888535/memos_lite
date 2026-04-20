@@ -21,14 +21,49 @@ def extract_l0(text: str, *, limit: int = 160) -> str:
 
 
 def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> str:
-    parts = []
+    """Build a compact digest by alternately sampling from user and assistant turns.
+
+    Instead of naively concatenating all messages (which biases toward the start
+    of the conversation), we take the *first* and *last* utterance of each role
+    and at most ``max_middle`` evenly-spaced middle samples.  This preserves the
+    opening question, the concluding answer, and a representative middle.
+    """
+    if not messages:
+        return ""
+
+    # Partition messages by role, preserving order within each role.
+    by_role: Dict[str, List[str]] = {}
     for message in messages:
         role = message.get("role")
         content = str(message.get("content") or "").strip()
         if role not in {"user", "assistant"} or not content:
             continue
-        parts.append(f"{role}: {content}")
-    digest = " ".join(parts)
+        by_role.setdefault(role, []).append(content)
+
+    max_middle = 2  # max intermediate samples per role
+    sampled: List[str] = []
+    for role in ("user", "assistant"):
+        turns = by_role.get(role, [])
+        if not turns:
+            continue
+        indices: list[int] = []
+        if len(turns) == 1:
+            indices = [0]
+        elif len(turns) == 2:
+            indices = [0, 1]
+        else:
+            # first, last, and up to max_middle evenly-spaced middle indices
+            indices = [0, len(turns) - 1]
+            step = max((len(turns) - 1) // (max_middle + 1), 1)
+            for i in range(1, max_middle + 1):
+                idx = min(i * step, len(turns) - 1)
+                if idx not in indices:
+                    indices.append(idx)
+            indices.sort()
+        for idx in indices:
+            sampled.append(f"{role}: {turns[idx]}")
+
+    digest = " ".join(sampled)
     return digest[:limit].strip()
 
 

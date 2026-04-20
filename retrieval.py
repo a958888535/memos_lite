@@ -11,29 +11,7 @@ from .noise import should_auto_retrieve
 from .scopes import filter_memories_for_query
 
 
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]+")
-
-
-def _expand_cjk_token(token: str) -> set[str]:
-    pieces = {token}
-    for size in (2, 3):
-        if len(token) < size:
-            continue
-        for index in range(len(token) - size + 1):
-            pieces.add(token[index : index + size])
-    return pieces
-
-
-def _tokens(text: str) -> set[str]:
-    tokens: set[str] = set()
-    for token in _TOKEN_RE.findall(str(text or "").lower()):
-        if not token:
-            continue
-        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
-            tokens.update(_expand_cjk_token(token))
-        else:
-            tokens.add(token)
-    return tokens
+from .tokenize import cjk_aware_tokens as _tokens
 
 
 def _lexical_score(query: str, item: dict) -> float:
@@ -146,13 +124,9 @@ class RetrievalEngine:
                 query_model = getattr(self._embedding_provider, "model", None)
                 query_dim = getattr(self._embedding_provider, "embedding_dim", None) or len(query_vector)
                 eligible_items: List[dict] = []
-                for item in self._store.iter_memories():
-                    if scope and item.get("scope") not in {scope, "global"}:
-                        continue
+                for item in self._store.iter_memories(scope=scope, tags=tags, has_embedding=True):
                     if not filter_memories_for_query([item], query=query, explicit_scope=scope):
                         diagnostics["dropped_by_scope"] += 1
-                        continue
-                    if tags and not set(tags).issubset(set(item.get("tags", []))):
                         continue
                     eligible_items.append(item)
 

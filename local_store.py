@@ -46,6 +46,7 @@ class LocalStore:
 
     def _initialize(self) -> None:
         with self._lock:
+            self._ensure_schema_version()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memories(
@@ -86,6 +87,20 @@ class LocalStore:
                 )
                 """
             )
+            # --- Performance indexes ---
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_updated ON memories(scope, updated_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_workflow_key ON memories(workflow_key) "
+                "WHERE workflow_key IS NOT NULL"
+            )
             try:
                 self._conn.execute(
                     """
@@ -121,6 +136,41 @@ class LocalStore:
                 self.fts_available = False
             self._conn.commit()
 
+    # ---- Schema migration -------------------------------------------------
+
+    _SCHEMA_VERSION = 1
+
+    def _ensure_schema_version(self) -> None:
+        """Simple version-based migration for future schema changes."""
+        meta_table = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'"
+        ).fetchone()
+        if not meta_table:
+            self._conn.execute(
+                "CREATE TABLE _meta(key TEXT PRIMARY KEY, value TEXT)"
+            )
+            self._conn.execute(
+                "INSERT INTO _meta(key, value) VALUES('schema_version', ?)",
+                (str(self._SCHEMA_VERSION),),
+            )
+            self._conn.commit()
+            return
+        row = self._conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()
+        version = int(row[0]) if row else 0
+        if version < self._SCHEMA_VERSION:
+            # Future ALTER TABLE migrations go here, version by version.
+            # Example:
+            #   if version < 2:
+            #       self._conn.execute("ALTER TABLE memories ADD COLUMN new_col TEXT")
+            #       version = 2
+            self._conn.execute(
+                "UPDATE _meta SET value=? WHERE key='schema_version'",
+                (str(self._SCHEMA_VERSION),),
+            )
+            self._conn.commit()
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -140,12 +190,66 @@ class LocalStore:
         return set(tags).issubset(set(row_tags))
 
     def _find_duplicate(self, content: str, scope: str, l0: str) -> dict | None:
+        """Find a near-duplicate memory within the same scope.
+
+        Strategy:
+          1. Exact match on normalised content (fast path).
+          2. If FTS5 is available, use it to narrow candidates to rows that
+             share at least one token with ``l0``, then run SequenceMatcher.
+          3. Fall back to full scope scan if FTS5 is absent.
+        """
+        normalized = _normalize_text(content)
+        normalized_l0 = _normalize_text(l0)
+
+        # --- Fast path: exact content match via indexed query ---------------
+        exact = self._conn.execute(
+            "SELECT * FROM memories WHERE scope = ? AND content = ? LIMIT 1",
+            (scope, content),
+        ).fetchone()
+        if exact:
+            return self._row_to_dict(exact)
+
+        # --- Candidate narrowing via FTS5 ----------------------------------
+        if self.fts_available and normalized_l0.strip():
+            # Use first few meaningful words as FTS query to avoid
+            # over-constraining the match.
+            fts_tokens = normalized_l0.split()[:6]
+            fts_query = " OR ".join(fts_tokens)
+            try:
+                cursor = self._conn.execute(
+                    """
+                    SELECT m.* FROM memories m
+                    JOIN memories_fts fts ON fts.rowid = m.rowid
+                    WHERE m.scope = ?
+                      AND memories_fts MATCH ?
+                    ORDER BY m.updated_at DESC
+                    LIMIT 50
+                    """,
+                    (scope, fts_query),
+                )
+            except sqlite3.OperationalError:
+                # FTS query syntax error — fall through to full scan.
+                cursor = None
+            if cursor is not None:
+                for row in cursor.fetchall():
+                    item = self._row_to_dict(row)
+                    # Re-check normalised exact match (FTS is token-based).
+                    if _normalize_text(item["content"]) == normalized:
+                        return item
+                    ratio = difflib.SequenceMatcher(
+                        None,
+                        normalized_l0,
+                        _normalize_text(item.get("l0") or item["content"]),
+                    ).ratio()
+                    if ratio >= 0.96:
+                        return item
+                return None
+
+        # --- Fallback: full scope scan --------------------------------------
         cursor = self._conn.execute(
             "SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC",
             (scope,),
         )
-        normalized = _normalize_text(content)
-        normalized_l0 = _normalize_text(l0)
         for row in cursor.fetchall():
             item = self._row_to_dict(row)
             if _normalize_text(item["content"]) == normalized:
@@ -334,12 +438,38 @@ class LocalStore:
                     break
             return collected[:limit]
 
-    def iter_memories(self) -> List[dict]:
+    def iter_memories(
+        self,
+        *,
+        scope: str | None = None,
+        tags: List[str] | None = None,
+        has_embedding: bool = False,
+    ) -> List[dict]:
+        """Iterate memories with optional server-side filtering.
+
+        When ``has_embedding`` is True, only rows with a non-null
+        ``embedding_json`` are returned — useful for vector search.
+        """
         with self._lock:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if scope is not None:
+                clauses.append("(scope = ? OR scope = 'global')")
+                params.append(scope)
+            if has_embedding:
+                clauses.append("embedding_json IS NOT NULL")
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
             rows = self._conn.execute(
-                "SELECT * FROM memories ORDER BY updated_at DESC"
+                f"SELECT * FROM memories{where} ORDER BY updated_at DESC",
+                params,
             ).fetchall()
-            return [self._row_to_dict(row) for row in rows]
+            result = [self._row_to_dict(row) for row in rows]
+            if tags:
+                tag_set = set(tags)
+                result = [
+                    r for r in result if tag_set.issubset(set(r.get("tags", [])))
+                ]
+            return result
 
     def search(
         self,
