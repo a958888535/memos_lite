@@ -1,0 +1,10 @@
+name: memos_lite
+version: 0.1.0
+description: Local-only lightweight memory provider for Hermes with optional minimal skill-update hint.
+hooks:
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
