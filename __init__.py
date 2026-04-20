@@ -99,7 +99,66 @@ class MemosLiteMemoryProvider(MemoryProvider):
             return False
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "key": "embedding.enabled",
+                "description": "Enable vector embeddings for semantic search (requires API key below).",
+                "required": False,
+                "default": "false",
+            },
+            {
+                "key": "embedding.model",
+                "description": "Embedding model (default: BAAI/bge-m3, supports BAAI/bge-m3, BAAI/bge-large-zh-v1.5).",
+                "required": False,
+                "default": "BAAI/bge-m3",
+            },
+            {
+                "key": "embedding.api_key_env",
+                "description": "SiliconFlow API key for embeddings.",
+                "secret": True,
+                "required": False,
+                "env_var": "SILICONFLOW_API_KEY",
+                "url": "https://www.siliconflow.cn",
+            },
+            {
+                "key": "summarizer.enabled",
+                "description": "Enable LLM summarization for long memories (>1200 chars).",
+                "required": False,
+                "default": "false",
+            },
+            {
+                "key": "summarizer.model",
+                "description": "LLM model for summarization (e.g. glm-4-flash or openai/gpt-4o-mini).",
+                "required": False,
+                "default": "",
+            },
+            {
+                "key": "summarizer.base_url",
+                "description": "Base URL for the summarization API.",
+                "required": False,
+                "default": "",
+            },
+            {
+                "key": "summarizer.api_key_env",
+                "description": "API key for the summarization endpoint.",
+                "secret": True,
+                "required": False,
+                "env_var": "MEMOS_SUMMARIZER_API_KEY",
+            },
+            {
+                "key": "retrieval.mode",
+                "description": "Search mode: hybrid (FTS + vector), fts (text-only), or vector (embedding-only).",
+                "required": False,
+                "choices": ["hybrid", "fts", "vector"],
+                "default": "hybrid",
+            },
+            {
+                "key": "skill_hint.enabled",
+                "description": "Emit skill-update hints when workflow evidence is detected in memory.",
+                "required": False,
+                "default": "true",
+            },
+        ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         data_dir = Path(hermes_home) / "memos_lite"
@@ -587,7 +646,14 @@ class MemosLiteMemoryProvider(MemoryProvider):
         )
 
 
+# Plugin loader entry point (called by plugins/memory/__init__.py)
+def get_provider() -> "MemosLiteMemoryProvider":
+    """Return a MemosLiteMemoryProvider instance for the plugin loader."""
+    return MemosLiteMemoryProvider()
+
+
 def register(ctx) -> None:
+    """Legacy plugin-style registration (still supported)."""
     provider = MemosLiteMemoryProvider()
     if hasattr(ctx, "register_memory_provider"):
         ctx.register_memory_provider(provider)
