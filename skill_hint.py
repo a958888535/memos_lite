@@ -139,7 +139,7 @@ class SkillHintEmitter:
         workflow_tokens = self._tokenize(workflow_key.replace("_", " "))
         return len(query_tokens & workflow_tokens)
 
-    def _candidate_sort_key(self, candidate: dict) -> tuple[float, float, float, str]:
+    def _candidate_sort_key(self, candidate: dict) -> tuple[float, float, float, float, str]:
         return (
             float(candidate["match_score"]),
             float(candidate["evidence_count"]),

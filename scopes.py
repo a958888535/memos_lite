@@ -199,6 +199,6 @@ def filter_memories_for_query(
     output = []
     for item in memories:
         scope = item.get("scope", "global")
-        if scope in allowed or scope == "global":
+        if scope in allowed:
             output.append(item)
     return output

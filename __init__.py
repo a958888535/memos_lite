@@ -80,6 +80,7 @@ class MemosLiteMemoryProvider(MemoryProvider):
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
         self._closer_threads: List[threading.Thread] = []
+        self._closer_lock = threading.Lock()
         self._prefetch_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_lock = threading.RLock()
         self._shutdown = False
@@ -104,7 +105,10 @@ class MemosLiteMemoryProvider(MemoryProvider):
         data_dir = Path(hermes_home) / "memos_lite"
         data_dir.mkdir(parents=True, exist_ok=True)
         config_path = data_dir / "config.json"
-        config_path.write_text(json.dumps(values, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            config_path.write_text(json.dumps(values, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            logger.error("memos_lite save_config failed: %s", exc)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._cleanup_closer_threads(wait=True)
@@ -271,8 +275,12 @@ class MemosLiteMemoryProvider(MemoryProvider):
             forgotten = self._store.forget(memory_id)
             return json.dumps({"forgotten": forgotten, "id": memory_id}, ensure_ascii=False)
         if tool_name == "memos_timeline":
+            try:
+                raw_limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return tool_error("memos_timeline: limit must be an integer")
             timeline = self._store.timeline(
-                limit=int(args.get("limit", 20)),
+                limit=max(1, min(raw_limit, 200)),
                 scope=args.get("scope"),
                 tags=args.get("tags"),
             )
@@ -368,13 +376,14 @@ class MemosLiteMemoryProvider(MemoryProvider):
             }
 
     def _cleanup_closer_threads(self, *, wait: bool) -> None:
-        active: List[threading.Thread] = []
-        for thread in self._closer_threads:
-            if wait and thread.is_alive():
-                thread.join()
-            if thread.is_alive():
-                active.append(thread)
-        self._closer_threads = active
+        with self._closer_lock:
+            active: List[threading.Thread] = []
+            for thread in self._closer_threads:
+                if wait and thread.is_alive():
+                    thread.join()
+                if thread.is_alive():
+                    active.append(thread)
+            self._closer_threads = active
 
     def _spawn_deferred_close(
         self,
@@ -412,7 +421,8 @@ class MemosLiteMemoryProvider(MemoryProvider):
 
         closer = threading.Thread(target=_finalize, daemon=True, name="memos-lite-closer")
         closer.start()
-        self._closer_threads.append(closer)
+        with self._closer_lock:
+            self._closer_threads.append(closer)
 
     def _release_runtime_refs(
         self,
@@ -493,11 +503,13 @@ class MemosLiteMemoryProvider(MemoryProvider):
     def _handle_turn(self, task: Dict[str, Any]) -> None:
         capture_cfg = self._config.get("capture", {})
         parts = []
-        if capture_cfg.get("include_user", True):
-            parts.append(f"User: {task.get('user', '')}")
-        if capture_cfg.get("include_assistant", True):
-            parts.append(f"Assistant: {task.get('assistant', '')}")
-        content = "\n".join(part for part in parts if part.strip()).strip()
+        user_text = str(task.get('user') or '').strip()
+        assistant_text = str(task.get('assistant') or '').strip()
+        if capture_cfg.get("include_user", True) and user_text:
+            parts.append(f"User: {user_text}")
+        if capture_cfg.get("include_assistant", True) and assistant_text:
+            parts.append(f"Assistant: {assistant_text}")
+        content = "\n".join(parts).strip()
         if not content:
             return
         self._remember_memory(
@@ -564,7 +576,7 @@ class MemosLiteMemoryProvider(MemoryProvider):
             session_id=session_id,
             source=source,
             scope=final_scope,
-            domain=domain or final_scope.split(":", 1)[-1] if final_scope.startswith("domain:") else domain,
+            domain=domain or (final_scope.split(":", 1)[-1] if final_scope.startswith("domain:") else domain),
             project_id=(metadata or {}).get("project_id") if metadata else None,
             tags=tags or [],
             metadata=metadata or {},

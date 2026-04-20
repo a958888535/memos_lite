@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import Iterable, List
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 from .policy import ensure_safe_base_url
 
@@ -43,6 +46,7 @@ class SiliconFlowEmbeddingProvider:
         self.timeout_seconds = float(config.get("timeout_seconds", 60))
         self.encoding_format = config.get("encoding_format", "float")
         self.embedding_dim: int | None = None
+        self._session = requests.Session()
 
     def _headers(self) -> dict:
         api_key = os.getenv(self.api_key_env, "").strip()
@@ -59,7 +63,7 @@ class SiliconFlowEmbeddingProvider:
         results: List[List[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start:start + self.batch_size]
-            response = requests.post(
+            response = self._session.post(
                 f"{self.base_url}/embeddings",
                 headers=self._headers(),
                 json={
@@ -74,6 +78,9 @@ class SiliconFlowEmbeddingProvider:
             data = payload.get("data") or []
             for item in data:
                 embedding = item.get("embedding") or []
+                if not embedding:
+                    logger.warning("Empty embedding returned for input, skipping")
+                    continue
                 if self.embedding_dim is None:
                     self.embedding_dim = len(embedding)
                 results.append([float(value) for value in embedding])

@@ -3,12 +3,13 @@ from __future__ import annotations
 import difflib
 import math
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from .embedding import cosine_similarity, same_embedding_space
 from .noise import should_auto_retrieve
-from .scopes import filter_memories_for_query
+from .scopes import _infer_query_scopes, filter_memories_for_query
 
 
 from .memos_tokenize import cjk_aware_tokens as _tokens
@@ -36,6 +37,8 @@ def _recency_decay(updated_at: str, half_life_days: float) -> float:
         updated = datetime.fromisoformat(updated_at)
     except Exception:
         return 0.0
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
     age_days = max((datetime.now(timezone.utc) - updated).total_seconds() / 86400.0, 0.0)
     if half_life_days <= 0:
         return 0.0
@@ -70,7 +73,13 @@ class RetrievalEngine:
         if config:
             self._config.update(config)
         self._embedding_provider = embedding_provider
-        self.last_diagnostics: Dict[str, Any] = {}
+        self._diagnostics_lock = threading.Lock()
+        self._last_diagnostics: Dict[str, Any] = {}
+
+    @property
+    def last_diagnostics(self) -> Dict[str, Any]:
+        with self._diagnostics_lock:
+            return dict(self._last_diagnostics)
 
     def _new_diagnostics(self) -> Dict[str, Any]:
         return {
@@ -97,7 +106,8 @@ class RetrievalEngine:
         diagnostics = self._new_diagnostics()
         if not should_auto_retrieve(query, manual=manual):
             diagnostics["dropped_by_noise"] = 1
-            self.last_diagnostics = diagnostics
+            with self._diagnostics_lock:
+                self._last_diagnostics = diagnostics
             return []
 
         mode = self._config.get("mode", "hybrid")
@@ -123,9 +133,14 @@ class RetrievalEngine:
                 query_vector = self._embedding_provider.embed_texts([query])[0]
                 query_model = getattr(self._embedding_provider, "model", None)
                 query_dim = getattr(self._embedding_provider, "embedding_dim", None) or len(query_vector)
+                # Pre-compute allowed scopes once instead of per-item
+                if explicit_scope:
+                    allowed_vector_scopes = {"global", explicit_scope}
+                else:
+                    allowed_vector_scopes = _infer_query_scopes(query)
                 eligible_items: List[dict] = []
                 for item in self._store.iter_memories(scope=scope, tags=tags, has_embedding=True):
-                    if not filter_memories_for_query([item], query=query, explicit_scope=scope):
+                    if item.get("scope", "global") not in allowed_vector_scopes:
                         diagnostics["dropped_by_scope"] += 1
                         continue
                     eligible_items.append(item)
@@ -206,7 +221,8 @@ class RetrievalEngine:
             ):
                 continue
             diversified.append(candidate)
-            if len(diversified) >= int(top_k or self._config.get("top_k", 8)):
+            effective_top_k = top_k if top_k is not None else self._config.get("top_k", 8)
+            if len(diversified) >= int(effective_top_k):
                 break
 
         for item in diversified:
@@ -215,5 +231,6 @@ class RetrievalEngine:
             item.pop("_vector_score", None)
 
         diagnostics["final_result_count"] = len(diversified)
-        self.last_diagnostics = diagnostics
+        with self._diagnostics_lock:
+            self._last_diagnostics = diagnostics
         return diversified

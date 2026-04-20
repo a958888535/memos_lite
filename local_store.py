@@ -428,19 +428,21 @@ class LocalStore:
             return self.get(memory_id, increment_access=False)
 
     def record_event(self, memory_id: str, event_type: str, metadata: Dict[str, Any] | None = None) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO memory_events(id, memory_id, event_type, created_at, metadata_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                f"evt_{uuid.uuid4().hex[:12]}",
-                memory_id,
-                event_type,
-                _utc_now(),
-                _as_json(metadata or {}),
-            ),
-        )
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(id, memory_id, event_type, created_at, metadata_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    f"evt_{uuid.uuid4().hex[:12]}",
+                    memory_id,
+                    event_type,
+                    _utc_now(),
+                    _as_json(metadata or {}),
+                ),
+            )
+            self._conn.commit()
 
     def get(self, memory_id: str, *, increment_access: bool = True) -> dict | None:
         with self._lock:
@@ -527,11 +529,13 @@ class LocalStore:
         scope: str | None = None,
         tags: List[str] | None = None,
         has_embedding: bool = False,
+        limit: int = 10000,
     ) -> List[dict]:
         """Iterate memories with optional server-side filtering.
 
         When ``has_embedding`` is True, only rows with a non-null
         ``embedding_json`` are returned — useful for vector search.
+        A ``limit`` cap (default 10000) prevents unbounded OOM.
         """
         with self._lock:
             clauses: list[str] = []
@@ -543,8 +547,8 @@ class LocalStore:
                 clauses.append("embedding_json IS NOT NULL")
             where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
             rows = self._conn.execute(
-                f"SELECT * FROM memories{where} ORDER BY updated_at DESC",
-                params,
+                f"SELECT * FROM memories{where} ORDER BY updated_at DESC LIMIT ?",
+                [*params, limit],
             ).fetchall()
             result = [self._row_to_dict(row) for row in rows]
             if tags:

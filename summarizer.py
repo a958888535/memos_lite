@@ -214,7 +214,10 @@ class OpenAICompatibleSummarizer:
             .rstrip("/")
         )
         self.api_key_env = config.get("api_key_env", "")
-        self.timeout_seconds = float(config.get("timeout_seconds", 60))
+        try:
+            self.timeout_seconds = float(config.get("timeout_seconds", 60))
+        except (TypeError, ValueError):
+            self.timeout_seconds = 60.0
         self._client: httpx.Client | None = None
 
     def _get_client(self) -> httpx.Client:
