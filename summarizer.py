@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 import httpx
@@ -10,6 +11,7 @@ from .policy import ensure_safe_base_url
 
 
 def extract_l0(text: str, *, limit: int = 160) -> str:
+    """Extract the first sentence as a compact label (l0)."""
     cleaned = " ".join(str(text or "").strip().split())
     if not cleaned:
         return ""
@@ -20,18 +22,49 @@ def extract_l0(text: str, *, limit: int = 160) -> str:
     return cleaned[:limit].strip()
 
 
+def _clean_summary(raw: str) -> str:
+    """Strip markdown formatting that glm-4.7-flash tends to add.
+
+    The model often wraps its answer in **Summary:** headers and bullet
+    lists.  We want a single clean sentence for memory storage.
+    """
+    if not raw:
+        return ""
+    # Remove markdown bold markers
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", raw)
+    # Remove leading label lines like "Summary:", "Sentence:", "Structured Fields:"
+    lines = []
+    skip_labels = {"summary", "summary:", "sentence", "sentence:", "structured fields", "structured fields:"}
+    for line in cleaned.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.rstrip(":").lower() in skip_labels:
+            continue
+        # Skip bullet lines from structured fields section
+        if s.startswith("* ") or s.startswith("- "):
+            continue
+        lines.append(s)
+    # Take the first substantive line (the actual summary sentence)
+    for line in lines:
+        if len(line) >= 10:
+            return line.strip()
+    # Fallback: return the longest line
+    if lines:
+        return max(lines, key=len).strip()
+    return cleaned.strip()[:200]
+
+
 def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> str:
     """Build a compact digest by alternately sampling from user and assistant turns.
 
     Instead of naively concatenating all messages (which biases toward the start
     of the conversation), we take the *first* and *last* utterance of each role
-    and at most ``max_middle`` evenly-spaced middle samples.  This preserves the
-    opening question, the concluding answer, and a representative middle.
+    and at most ``max_middle`` evenly-spaced middle samples.
     """
     if not messages:
         return ""
 
-    # Partition messages by role, preserving order within each role.
     by_role: Dict[str, List[str]] = {}
     for message in messages:
         role = message.get("role")
@@ -40,7 +73,7 @@ def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> st
             continue
         by_role.setdefault(role, []).append(content)
 
-    max_middle = 2  # max intermediate samples per role
+    max_middle = 2
     sampled: List[str] = []
     for role in ("user", "assistant"):
         turns = by_role.get(role, [])
@@ -52,7 +85,6 @@ def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> st
         elif len(turns) == 2:
             indices = [0, 1]
         else:
-            # first, last, and up to max_middle evenly-spaced middle indices
             indices = [0, len(turns) - 1]
             step = max((len(turns) - 1) // (max_middle + 1), 1)
             for i in range(1, max_middle + 1):
@@ -68,6 +100,13 @@ def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> st
 
 
 class OpenAICompatibleSummarizer:
+    """LLM-backed summarizer using OpenAI-compatible chat completions API.
+
+    For glm-4.7-flash, thinking is disabled so the summary lands directly
+    in ``message.content``.  A post-processing step strips any markdown
+    formatting the model adds despite the one-sentence prompt.
+    """
+
     def __init__(self, config: dict):
         self.model = config.get("model", "")
         self.base_url = (
@@ -103,12 +142,16 @@ class OpenAICompatibleSummarizer:
                         {
                             "role": "user",
                             "content": (
-                                "Summarize this conversation fragment into a compact episodic memory "
-                                "with one sentence and optional structured fields.\n\n"
+                                "Summarize this conversation fragment into one compact sentence "
+                                "for episodic memory storage. Output ONLY the summary sentence, "
+                                "nothing else.\n\n"
                                 f"{text}"
                             ),
                         }
                     ],
+                    # glm-4.7-flash enables thinking by default which puts
+                    # output into reasoning_content instead of content.
+                    "thinking": {"type": "disabled"},
                 },
             )
             response.raise_for_status()
@@ -123,6 +166,10 @@ class OpenAICompatibleSummarizer:
         if choices:
             message = choices[0].get("message") or {}
             content = str(message.get("content") or "").strip()
+
+        # Post-process: strip markdown the model may add despite instructions
+        content = _clean_summary(content)
+
         return {
             "summary": content,
             "l1_json": json.dumps({"summary": content}, ensure_ascii=False) if content else None,
@@ -132,4 +179,3 @@ class OpenAICompatibleSummarizer:
         if self._client is not None:
             self._client.close()
             self._client = None
-
