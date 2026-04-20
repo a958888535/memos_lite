@@ -11,7 +11,7 @@ from .noise import should_auto_retrieve
 from .scopes import filter_memories_for_query
 
 
-from .tokenize import cjk_aware_tokens as _tokens
+from .memos_tokenize import cjk_aware_tokens as _tokens
 
 
 def _lexical_score(query: str, item: dict) -> float:

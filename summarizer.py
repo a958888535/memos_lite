@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any, Dict, List
 
-import requests
+import httpx
 
 from .policy import ensure_safe_base_url
 
@@ -70,37 +70,54 @@ def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> st
 class OpenAICompatibleSummarizer:
     def __init__(self, config: dict):
         self.model = config.get("model", "")
-        self.base_url = ensure_safe_base_url(config.get("base_url", ""), purpose="memory_summarize").rstrip("/")
+        self.base_url = (
+            ensure_safe_base_url(config.get("base_url", ""), purpose="memory_summarize")
+            .rstrip("/")
+        )
         self.api_key_env = config.get("api_key_env", "")
         self.timeout_seconds = float(config.get("timeout_seconds", 60))
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self.timeout_seconds, connect=10.0),
+                headers={
+                    "Authorization": f"Bearer {os.getenv(self.api_key_env, '').strip()}",
+                    "Content-Type": "application/json",
+                },
+            )
+        return self._client
 
     def summarize(self, text: str) -> Dict[str, Any]:
-        api_key = os.getenv(self.api_key_env, "").strip()
-        if not self.base_url or not self.model or not api_key:
+        if not self.base_url or not self.model or not os.getenv(self.api_key_env, "").strip():
             raise RuntimeError("Summarizer is enabled but not fully configured")
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Summarize this conversation fragment into a compact episodic memory "
-                            "with one sentence and optional structured fields.\n\n"
-                            f"{text}"
-                        ),
-                    }
-                ],
-            },
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            client = self._get_client()
+            response = client.post(
+                "/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Summarize this conversation fragment into a compact episodic memory "
+                                "with one sentence and optional structured fields.\n\n"
+                                f"{text}"
+                            ),
+                        }
+                    ],
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(f"Summarizer HTTP error {exc.response.status_code}: {exc.response.text[:200]}") from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Summarizer request failed: {exc}") from exc
+
         choices = payload.get("choices") or []
         content = ""
         if choices:
@@ -110,3 +127,9 @@ class OpenAICompatibleSummarizer:
             "summary": content,
             "l1_json": json.dumps({"summary": content}, ensure_ascii=False) if content else None,
         }
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+

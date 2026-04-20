@@ -45,8 +45,22 @@ def _normalize(text: str) -> str:
     return " ".join(str(text or "").strip().lower().split())
 
 
+_NEGATION_PREFIXES = ("don't ", "doesn't ", "not ", "isn't ", "can't ", "won't ")
+
+
 def has_memory_cue(text: str) -> bool:
     lowered = _normalize(text)
+    # Reject negated contexts: "I don't remember …" is not a memory cue.
+    for neg in _NEGATION_PREFIXES:
+        idx = lowered.find(neg)
+        if idx != -1:
+            # Check if any cue appears ONLY after the negation
+            after_neg = lowered[idx + len(neg):]
+            before_neg = lowered[:idx]
+            if any(cue in after_neg for cue in _MEMORY_CUES) and not any(
+                cue in before_neg for cue in _MEMORY_CUES
+            ):
+                return False
     return any(cue in lowered for cue in _MEMORY_CUES)
 
 

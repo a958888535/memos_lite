@@ -35,7 +35,7 @@ _COMPANION_SKILL_DESCRIPTION = (
     "Interpret memos_lite skill-update hint metadata and decide whether native Hermes "
     "skill_manage should be used."
 )
-from .tokenize import cjk_aware_tokens
+from .memos_tokenize import cjk_aware_tokens
 
 
 _PREFETCH_STOPWORDS = {
@@ -396,8 +396,10 @@ class MemosLiteMemoryProvider(MemoryProvider):
                 try:
                     if store:
                         store.close()
+                    if summarizer:
+                        summarizer.close()
                 except Exception:
-                    logger.debug("memos_lite deferred store close failed", exc_info=True)
+                    logger.debug("memos_lite deferred store/summarizer close failed", exc_info=True)
                 self._release_runtime_refs(
                     worker=worker,
                     runtime_queue=runtime_queue,
@@ -476,6 +478,8 @@ class MemosLiteMemoryProvider(MemoryProvider):
 
         if store:
             store.close()
+        if summarizer:
+            summarizer.close()
         self._release_runtime_refs(
             worker=worker,
             runtime_queue=runtime_queue,

@@ -7,6 +7,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from datasketch import MinHash, MinHashLSH
 from typing import Any, Dict, Iterable, List
 
 
@@ -16,6 +17,20 @@ def _utc_now() -> str:
 
 def _normalize_text(text: str) -> str:
     return " ".join(str(text or "").strip().lower().split())
+
+
+def _build_minhash(text: str, num_perm: int = 128) -> MinHash:
+    """Build a MinHash from ``text`` using character-level 2/3-grams."""
+    import re as _re
+
+    tokens = _re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff]{2,}", str(text or ""))
+    mh = MinHash(num_perm=num_perm)
+    for t in tokens:
+        for n in (2, 3):
+            if len(t) >= n:
+                for i in range(len(t) - n + 1):
+                    mh.update(t[i : i + n].encode("utf8"))
+    return mh
 
 
 def _as_json(value: Any) -> str | None:
@@ -189,19 +204,88 @@ class LocalStore:
             return True
         return set(tags).issubset(set(row_tags))
 
+    # ---- MinHash-based near-duplicate detection -----------------------------
+
+    _MINHASH_PARAMS = {
+        "num_perm": 128,
+        "lsh_threshold": 0.5,
+        "max_candidates": 20,
+    }
+
+    class MinHashHelper:
+        """In-memory LSH index rebuilt lazily after write operations.
+
+        SQLite is the source of truth; this class is purely a speed layer
+        that gives sub-linear candidate lookup (O(1) hash-table bucket access
+        instead of O(N) table scans).
+        """
+
+        __slots__ = ("_conn", "_params", "_index", "_hashes", "_built")
+
+        def __init__(self, conn: sqlite3.Connection, params: dict | None = None):
+            self._conn = conn
+            self._params = {**LocalStore._MINHASH_PARAMS, **(params or {})}
+            self._index: MinHashLSH | None = None
+            self._hashes: Dict[str, tuple[str, MinHash]] = {}
+            self._built = False
+
+        def _build(self) -> None:
+            rows = self._conn.execute(
+                "SELECT id, scope, l0, content FROM memories"
+            ).fetchall()
+            p = self._params
+            self._index = MinHashLSH(
+                threshold=p["lsh_threshold"], num_perm=p["num_perm"]
+            )
+            self._hashes = {}
+            for row in rows:
+                mid, scope, l0, content = row
+                key_text = l0 or content or ""
+                mh = _build_minhash(key_text, p["num_perm"])
+                try:
+                    self._index.insert(mid, mh)
+                except Exception:
+                    pass
+                self._hashes[mid] = (scope or "", mh)
+            self._built = True
+
+        def ensure_index(self) -> None:
+            if not self._built:
+                self._build()
+
+        def query(self, text: str, scope: str) -> List[str]:
+            self.ensure_index()
+            if self._index is None:
+                return []
+            p = self._params
+            mh = _build_minhash(text, p["num_perm"])
+            raw = self._index.query(mh)[: p["max_candidates"]]
+            return [
+                mid
+                for mid in raw
+                if self._hashes.get(mid, ("", None))[0] == scope
+            ]
+
+        def invalidate(self) -> None:
+            self._built = False
+            self._index = None
+            self._hashes = {}
+
+    # -------------------------------------------------------------------------
+
     def _find_duplicate(self, content: str, scope: str, l0: str) -> dict | None:
         """Find a near-duplicate memory within the same scope.
 
-        Strategy:
-          1. Exact match on normalised content (fast path).
-          2. If FTS5 is available, use it to narrow candidates to rows that
-             share at least one token with ``l0``, then run SequenceMatcher.
-          3. Fall back to full scope scan if FTS5 is absent.
+        Strategy (fastest-first):
+          1. Exact content match via indexed SQL query.
+          2. MinHash LSH approximate nearest-neighbour search (sub-linear).
+          3. Precise SequenceMatcher verification on LSH candidates.
+          4. Full scope scan as final fallback.
         """
         normalized = _normalize_text(content)
         normalized_l0 = _normalize_text(l0)
 
-        # --- Fast path: exact content match via indexed query ---------------
+        # --- Step 1: exact match (indexed, O(log N)) ------------------------
         exact = self._conn.execute(
             "SELECT * FROM memories WHERE scope = ? AND content = ? LIMIT 1",
             (scope, content),
@@ -209,43 +293,35 @@ class LocalStore:
         if exact:
             return self._row_to_dict(exact)
 
-        # --- Candidate narrowing via FTS5 ----------------------------------
-        if self.fts_available and normalized_l0.strip():
-            # Use first few meaningful words as FTS query to avoid
-            # over-constraining the match.
-            fts_tokens = normalized_l0.split()[:6]
-            fts_query = " OR ".join(fts_tokens)
-            try:
-                cursor = self._conn.execute(
-                    """
-                    SELECT m.* FROM memories m
-                    JOIN memories_fts fts ON fts.rowid = m.rowid
-                    WHERE m.scope = ?
-                      AND memories_fts MATCH ?
-                    ORDER BY m.updated_at DESC
-                    LIMIT 50
-                    """,
-                    (scope, fts_query),
-                )
-            except sqlite3.OperationalError:
-                # FTS query syntax error — fall through to full scan.
-                cursor = None
-            if cursor is not None:
-                for row in cursor.fetchall():
-                    item = self._row_to_dict(row)
-                    # Re-check normalised exact match (FTS is token-based).
-                    if _normalize_text(item["content"]) == normalized:
-                        return item
-                    ratio = difflib.SequenceMatcher(
-                        None,
-                        normalized_l0,
-                        _normalize_text(item.get("l0") or item["content"]),
-                    ).ratio()
-                    if ratio >= 0.96:
-                        return item
-                return None
+        # --- Steps 2–3: MinHash LSH + precise verification -----------------
+        if not hasattr(self, "_lsh_helper"):
+            self._lsh_helper = self.MinHashHelper(self._conn)
+        self._lsh_helper.ensure_index()
+        candidate_ids = self._lsh_helper.query(normalized_l0 or normalized, scope)
+        if candidate_ids:
+            rows_by_id = {}
+            placeholders = ",".join("?" * len(candidate_ids))
+            for row in self._conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                candidate_ids,
+            ).fetchall():
+                item = self._row_to_dict(row)
+                rows_by_id[item["id"]] = item
+            for mid in candidate_ids:
+                item = rows_by_id.get(mid)
+                if item is None:
+                    continue
+                if _normalize_text(item["content"]) == normalized:
+                    return item
+                ratio = difflib.SequenceMatcher(
+                    None,
+                    normalized_l0,
+                    _normalize_text(item.get("l0") or item["content"]),
+                ).ratio()
+                if ratio >= 0.96:
+                    return item
 
-        # --- Fallback: full scope scan --------------------------------------
+        # --- Step 4: full scope scan (last resort) -------------------------
         cursor = self._conn.execute(
             "SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC",
             (scope,),
@@ -262,6 +338,7 @@ class LocalStore:
             if ratio >= 0.96:
                 return item
         return None
+
 
     def remember(
         self,
@@ -307,6 +384,8 @@ class LocalStore:
                     ),
                 )
                 self._conn.commit()
+                if hasattr(self, "_lsh_helper"):
+                    self._lsh_helper.invalidate()
                 return self.get(dedup["id"], increment_access=False)
 
             memory_id = f"mem_{uuid.uuid4().hex[:12]}"
@@ -344,6 +423,8 @@ class LocalStore:
             )
             self.record_event(memory_id, "remember", {"source": source or "unknown"})
             self._conn.commit()
+            if hasattr(self, "_lsh_helper"):
+                self._lsh_helper.invalidate()
             return self.get(memory_id, increment_access=False)
 
     def record_event(self, memory_id: str, event_type: str, metadata: Dict[str, Any] | None = None) -> None:
@@ -397,6 +478,8 @@ class LocalStore:
                 (memory_id,),
             )
             self._conn.commit()
+            if hasattr(self, "_lsh_helper"):
+                self._lsh_helper.invalidate()
             return deleted > 0
 
     def timeline(

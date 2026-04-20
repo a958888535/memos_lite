@@ -13,6 +13,8 @@ _TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]+")
 
 def expand_cjk(token: str, sizes: tuple[int, ...] = (2, 3)) -> set[str]:
     """Return the original token plus its CJK n-gram pieces."""
+    if not token:
+        return set()
     pieces: set[str] = {token}
     for size in sizes:
         if len(token) < size:
