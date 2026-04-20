@@ -5,59 +5,105 @@ from typing import Iterable, List
 
 
 _HEALTH_TERMS = (
-    "health",
-    "medical",
     "blood pressure",
-    "sleep",
     "diagnosis",
-    "健康",
-    "医疗",
+    "prescription",
+    "medication",
+    "医院",
     "血压",
     "睡眠",
     "诊断",
     "用药",
     "药物",
+    "治疗",
+    "症状",
+    "体检",
+    "患者",
 )
 _QUANT_TERMS = (
-    "quant",
-    "finance",
-    "accounting",
-    "event study",
-    "regression",
-    "did",
+    "quantitative trading",
+    "quant trading",
+    "backtest",
+    "alpha factor",
+    "portfolio",
+    "sharpe ratio",
+    "drawdown",
     "量化",
-    "金融",
-    "财务",
-    "会计",
-    "事件研究",
-    "回归",
-    "双重差分",
+    "回测",
+    "因子",
+    "选股",
+    "夏普",
+    "动量",
+    "对冲",
+    "期货",
+    "收益率",
+    "最大回撤",
+    "多因子",
 )
 _PAPER_TERMS = (
-    "paper",
     "literature review",
     "manuscript",
-    "theory",
     "journal",
-    "论文",
+    "proceedings",
+    "arxiv",
+    "doi:",
+    "citation",
     "文献综述",
     "手稿",
-    "理论",
     "期刊",
+    "引用",
+    "被引",
+    "综述",
 )
 _RESEARCH_TERMS = (
-    "research",
     "hypothesis",
     "experiment",
-    "identification",
-    "dataset",
-    "研究",
+    "identification strategy",
+    "causal inference",
+    "difference-in-differences",
+    "instrumental variable",
+    "regression discontinuity",
+    "RCT",
+    "panel data",
+    "fixed effects",
     "假设",
     "实验",
-    "识别",
-    "数据集",
+    "识别策略",
+    "因果推断",
+    "双重差分",
+    "工具变量",
+    "断点回归",
+    "面板数据",
+    "固定效应",
 )
-_NEWS_TERMS = ("news", "headline", "breaking", "today", "新闻", "头条", "快讯", "今日")
+_NEWS_TERMS = ("breaking news", "headline news", "新闻", "头条", "快讯", "热点新闻")
+_TECH_TERMS = (
+    "python",
+    "javascript",
+    "asyncio",
+    "docker",
+    "kubernetes",
+    "linux",
+    "api",
+    "database",
+    "redis",
+    "nginx",
+    "webhook",
+    "git",
+    "编译",
+    "部署",
+    "调试",
+    "服务器",
+    "数据库",
+    "容器",
+    "接口",
+    "缓存",
+    "异步",
+    "并发",
+    "分词",
+    "去重",
+    "tokeniz",
+)
 
 
 def _has_any_term(text: str, terms: tuple[str, ...]) -> bool:
@@ -104,6 +150,8 @@ def infer_scope(
         return defaults.get("health_default", "domain:health")
     if domain_label == "quant" or _has_any_term(lowered, _QUANT_TERMS):
         return defaults.get("quant_default", "domain:quant")
+    if domain_label == "tech" or _has_any_term(lowered, _TECH_TERMS):
+        return defaults.get("tech_default", "domain:tech")
     if domain_label == "paper" or _has_any_term(lowered, _PAPER_TERMS):
         return defaults.get("paper_default", "domain:paper")
     if domain_label == "research" or _has_any_term(lowered, _RESEARCH_TERMS):
@@ -126,6 +174,8 @@ def _infer_query_scopes(query: str) -> set[str]:
         scopes.add("domain:health")
     if _has_any_term(lowered, _QUANT_TERMS):
         scopes.add("domain:quant")
+    if _has_any_term(lowered, _TECH_TERMS):
+        scopes.add("domain:tech")
     if _has_any_term(lowered, _PAPER_TERMS):
         scopes.add("domain:paper")
     if _has_any_term(lowered, _RESEARCH_TERMS):

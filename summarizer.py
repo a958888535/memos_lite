@@ -10,16 +10,52 @@ import httpx
 from .policy import ensure_safe_base_url
 
 
+# Patterns to strip from content before extracting l0 or building digest.
+_NOISE_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Markdown links: [text](url) → text
+    (re.compile(r"\[([^\]]*)\]\([^)]*\)"), r"\1"),
+    # HTML/Markdown images: ![alt](url)
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), ""),
+    # URLs standalone
+    (re.compile(r"https?://\S+"), ""),
+    # System markers like [CONTEXT COMPACTION ...] or [System note: ...]
+    (re.compile(r"\[(?:CONTEXT\s+COMPACTION|System\s+note?)[^\]]*\]", re.IGNORECASE), ""),
+    # Feishu-style @mentions: @_user_1  or @_all
+    (re.compile(r"@_\w+"), ""),
+    # Tool call artifacts: <function_calls>...</function_calls>
+    (re.compile(r"<function_calls>.*?</function_calls>", re.DOTALL), ""),
+    # XML/HTML tags
+    (re.compile(r"<[^>]+>"), ""),
+    # Leading/trailing markdown bold/italic
+    (re.compile(r"^[*_]+|[*_]+$"), ""),
+]
+
+
+def _strip_noise(text: str) -> str:
+    """Remove markdown URLs, system markers, and other non-content noise."""
+    for pattern, replacement in _NOISE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    # Collapse whitespace
+    return " ".join(text.split())
+
+
 def extract_l0(text: str, *, limit: int = 160) -> str:
-    """Extract the first sentence as a compact label (l0)."""
-    cleaned = " ".join(str(text or "").strip().split())
+    """Extract the first substantive sentence as a compact label (l0).
+
+    Strips markdown URLs, system markers, and other noise before extracting.
+    """
+    cleaned = _strip_noise(str(text or ""))
     if not cleaned:
         return ""
     for separator in (". ", "。", "\n"):
         if separator in cleaned:
             cleaned = cleaned.split(separator, 1)[0]
             break
-    return cleaned[:limit].strip()
+    result = cleaned[:limit].strip()
+    # If result looks like pure noise (no CJK or alpha chars), return empty
+    if result and not re.search(r"[\u4e00-\u9fff a-zA-Z]", result):
+        return ""
+    return result
 
 
 def _clean_summary(raw: str) -> str:
@@ -55,45 +91,109 @@ def _clean_summary(raw: str) -> str:
     return cleaned.strip()[:200]
 
 
-def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 400) -> str:
-    """Build a compact digest by alternately sampling from user and assistant turns.
+def _tfidf_top(message: str, all_messages: list[str], top_k: int = 12) -> str:
+    """Return a compact version of *message* keeping only the most distinctive tokens.
 
-    Instead of naively concatenating all messages (which biases toward the start
-    of the conversation), we take the *first* and *last* utterance of each role
-    and at most ``max_middle`` evenly-spaced middle samples.
+    Uses a simple TF-IDF heuristic: tokens that appear in fewer messages across
+    the conversation are more distinctive.  We keep sentences that score highest.
+    """
+    if len(message) <= 120:
+        return message
+
+    # Token frequency across all messages (simple word-level)
+    doc_freq: dict[str, int] = {}
+    n_docs = len(all_messages)
+    for doc in all_messages:
+        seen = set(doc.lower().split())
+        for tok in seen:
+            doc_freq[tok] = doc_freq.get(tok, 0) + 1
+
+    # Score each sentence by average IDF of its tokens
+    sentences = re.split(r"(?<=[.。!?！？])\s+|\n", message)
+    best = message[:120]
+    best_score = -1.0
+    for s in sentences:
+        s = s.strip()
+        if len(s) < 10:
+            continue
+        toks = s.lower().split()
+        if not toks:
+            continue
+        score = sum(
+            (n_docs / max(doc_freq.get(t, 1), 1))
+            for t in toks
+        ) / len(toks)
+        if score > best_score:
+            best_score = score
+            best = s[:120]
+    return best
+
+
+def extractive_digest(messages: List[Dict[str, Any]], *, limit: int = 600) -> str:
+    """Build a compact digest preserving high-information-density turns.
+
+    Strategy:
+    1. Always include the first user message (the question/topic).
+    2. Score every message by TF-IDF distinctiveness.
+    3. Pick the top-N scoring messages, interleaving user/assistant roles.
+    4. Always include the last assistant message (the conclusion).
+    5. Strip noise (URLs, system markers) from each selected turn.
     """
     if not messages:
         return ""
 
+    # Partition by role, preserving order
     by_role: Dict[str, List[str]] = {}
+    all_texts: list[str] = []
     for message in messages:
         role = message.get("role")
         content = str(message.get("content") or "").strip()
         if role not in {"user", "assistant"} or not content:
             continue
-        by_role.setdefault(role, []).append(content)
+        cleaned = _strip_noise(content)
+        if not cleaned or len(cleaned) < 5:
+            continue
+        by_role.setdefault(role, []).append(cleaned)
+        all_texts.append(cleaned)
 
-    max_middle = 2
+    if not all_texts:
+        return ""
+
+    max_turns = 8  # total turns to sample
     sampled: List[str] = []
+
     for role in ("user", "assistant"):
         turns = by_role.get(role, [])
         if not turns:
             continue
-        indices: list[int] = []
-        if len(turns) == 1:
-            indices = [0]
-        elif len(turns) == 2:
-            indices = [0, 1]
+
+        if len(turns) <= 3:
+            # Few turns: keep them all, truncated
+            for t in turns:
+                sampled.append(f"{role}: {_tfidf_top(t, all_texts)}")
         else:
-            indices = [0, len(turns) - 1]
-            step = max((len(turns) - 1) // (max_middle + 1), 1)
-            for i in range(1, max_middle + 1):
-                idx = min(i * step, len(turns) - 1)
-                if idx not in indices:
-                    indices.append(idx)
-            indices.sort()
-        for idx in indices:
-            sampled.append(f"{role}: {turns[idx]}")
+            # Always first + last, then top distinctive middles
+            picked = {0, len(turns) - 1}
+            # Score middle turns
+            scored: list[tuple[float, int]] = []
+            for idx in range(1, len(turns) - 1):
+                t = turns[idx]
+                toks = set(t.lower().split())
+                if not toks:
+                    continue
+                # IDF-based distinctiveness
+                n = len(all_texts)
+                score = sum(
+                    n / max(sum(1 for d in all_texts if tok in d.lower()), 1)
+                    for tok in toks
+                ) / max(len(toks), 1)
+                scored.append((score, idx))
+            # Pick top distinctive middles
+            scored.sort(reverse=True)
+            for _, idx in scored[:max(max_turns // 2 - 2, 1)]:
+                picked.add(idx)
+            for idx in sorted(picked):
+                sampled.append(f"{role}: {_tfidf_top(turns[idx], all_texts)}")
 
     digest = " ".join(sampled)
     return digest[:limit].strip()
